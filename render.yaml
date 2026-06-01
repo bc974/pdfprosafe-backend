@@ -1,0 +1,19 @@
+# Render Blueprint — deploy this service straight from the repo.
+# In Render: New → Blueprint → connect the GitHub repo containing this file.
+services:
+  - type: web
+    name: pdfprosafe-backend
+    runtime: node
+    plan: free
+    region: frankfurt # closest to EU users; change if you prefer
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: ALLOWED_ORIGINS
+        value: https://pdfprosafe.com,https://www.pdfprosafe.com
+      - key: MAX_UPLOAD_BYTES
+        value: "26214400" # 25 MB
