@@ -11,13 +11,21 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import rateLimit from "express-rate-limit";
 
-import { extractPdf } from "./lib/extract.js";
+import { extractPdf, MAX_PAGES } from "./lib/extract.js";
 import { buildWord } from "./lib/to-word.js";
 import { buildExcel } from "./lib/to-excel.js";
 
 const PORT = process.env.PORT || 8080;
 const MAX_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024); // 25 MB
+// Hard ceiling on how long a single conversion may run before we give up — keeps
+// a pathological PDF from pinning the (small, free-tier) instance indefinitely.
+const CONVERT_TIMEOUT_MS = Number(process.env.CONVERT_TIMEOUT_MS || 45_000);
+// Per-IP throttle: a public endpoint will get scraped/abused otherwise, which
+// would burn the free instance hours and degrade service for real users.
+const RATE_WINDOW_MS = Number(process.env.RATE_WINDOW_MS || 10 * 60 * 1000);
+const RATE_MAX = Number(process.env.RATE_MAX || 30);
 
 // Origins allowed to call the API. Override in prod via ALLOWED_ORIGINS
 // (comma-separated). Defaults cover the live site and local Next dev server.
@@ -31,6 +39,22 @@ const ALLOWED = (
 
 const app = express();
 app.disable("x-powered-by");
+// Render terminates TLS at a proxy and forwards the client IP in X-Forwarded-For.
+// Trust exactly one hop so the rate limiter keys on the real client, not the proxy.
+app.set("trust proxy", 1);
+
+// Throttle the conversion endpoints (health stays unthrottled for uptime pings).
+const convertLimiter = rateLimit({
+  windowMs: RATE_WINDOW_MS,
+  max: RATE_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (_req, res) =>
+    res.status(429).json({
+      error: "rate_limited",
+      message: "Too many conversions from this address. Please wait a few minutes.",
+    }),
+});
 
 app.use(
   cors({
@@ -77,40 +101,15 @@ const CONVERTERS = {
 };
 
 for (const [target, cfg] of Object.entries(CONVERTERS)) {
-  app.post(`/convert/${target}`, upload.single("file"), async (req, res, next) => {
+  app.post(`/convert/${target}`, convertLimiter, upload.single("file"), async (req, res, next) => {
     try {
       if (!req.file) throw httpError(400, "no_file", "No file was uploaded.");
 
-      let extracted;
-      try {
-        extracted = await extractPdf(req.file.buffer);
-      } catch (parseErr) {
-        // pdfjs throws on corrupt or encrypted PDFs — surface a clean 4xx
-        // rather than a 500, and point encrypted files at the Unlock tool.
-        if (parseErr?.name === "PasswordException") {
-          throw httpError(
-            422,
-            "encrypted",
-            "This PDF is password-protected. Remove the password first (Unlock PDF), then convert.",
-          );
-        }
-        throw httpError(
-          422,
-          "bad_pdf",
-          "This file could not be read as a PDF — it may be corrupt.",
-        );
-      }
-      // A scanned/image-only PDF has (almost) no extractable text — there is
-      // nothing to reconstruct. Tell the client to OCR first.
-      if (extracted.charCount < 8) {
-        throw httpError(
-          422,
-          "no_text",
-          "This PDF has no extractable text (it may be scanned). Run OCR first.",
-        );
-      }
-
-      const out = await cfg.build(extracted);
+      // Whole pipeline (parse → build) is bounded by a single timeout.
+      const out = await withTimeout(
+        runConversion(cfg, req.file.buffer),
+        CONVERT_TIMEOUT_MS,
+      );
       const base = safeBase(req.file.originalname);
       res.setHeader("Content-Type", cfg.mime);
       res.setHeader(
@@ -145,6 +144,50 @@ function httpError(status, code, message) {
   e.status = status;
   e.code = code;
   return e;
+}
+
+/** Parse → validate → build, translating low-level failures into clean 4xx. */
+async function runConversion(cfg, buffer) {
+  let extracted;
+  try {
+    extracted = await extractPdf(buffer);
+  } catch (parseErr) {
+    if (parseErr?.code === "too_many_pages") {
+      throw httpError(413, "too_many_pages", `This PDF has too many pages (limit ${MAX_PAGES}).`);
+    }
+    // pdfjs throws on corrupt or encrypted PDFs — surface a clean 4xx rather
+    // than a 500, and point encrypted files at the Unlock tool.
+    if (parseErr?.name === "PasswordException") {
+      throw httpError(
+        422,
+        "encrypted",
+        "This PDF is password-protected. Remove the password first (Unlock PDF), then convert.",
+      );
+    }
+    throw httpError(422, "bad_pdf", "This file could not be read as a PDF — it may be corrupt.");
+  }
+  // A scanned/image-only PDF has (almost) no extractable text — nothing to
+  // reconstruct. Tell the client to OCR first.
+  if (extracted.charCount < 8) {
+    throw httpError(
+      422,
+      "no_text",
+      "This PDF has no extractable text (it may be scanned). Run OCR first.",
+    );
+  }
+  return cfg.build(extracted);
+}
+
+/** Reject with a 503 `timeout` error if `promise` doesn't settle within `ms`. */
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(httpError(503, "timeout", "Conversion took too long. Try a smaller or simpler PDF.")),
+      ms,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 /** Strip path/extension and unsafe chars from an uploaded filename. */
