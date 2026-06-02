@@ -1,0 +1,26 @@
+name: Keep Render warm
+
+# Render's free instance sleeps after ~15 min idle and cold-starts in 30–50 s.
+# Pinging /health every ~14 min keeps it awake during the day, eliminating the
+# cold start entirely — well within the free 750 h/month budget.
+#
+# Note: GitHub disables scheduled workflows after 60 days with no repo activity;
+# any push (or a manual run via "Run workflow") re-arms it.
+
+on:
+  schedule:
+    - cron: "*/14 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /health
+        run: |
+          # --max-time 60 tolerates a cold-start wake-up; never fail the job.
+          curl -fsS --max-time 60 https://pdfprosafe-backend.onrender.com/health || true
