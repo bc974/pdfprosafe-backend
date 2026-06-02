@@ -22,7 +22,7 @@
     "mammoth": "^1.8.0",
     "multer": "^2.0.1",
     "pdf-to-img": "^6.1.0",
-    "pdfjs-dist": "^5.7.284",
+    "pdfjs-dist": "^6.0.227",
     "pdfkit": "^0.15.2",
     "pptxgenjs": "^4.0.1"
   },
