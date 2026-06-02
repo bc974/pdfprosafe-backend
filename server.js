@@ -3,6 +3,7 @@
 // PDF ↔ Office conversions (both directions), all in-memory:
 //   POST /convert/word         → PDF → .docx
 //   POST /convert/excel        → PDF → .xlsx
+//   POST /convert/powerpoint   → PDF → .pptx (one slide per page, rasterized)
 //   POST /convert/word-to-pdf  → .docx → PDF
 //   POST /convert/excel-to-pdf → .xlsx → PDF
 //
@@ -20,6 +21,7 @@ import { buildWord } from "./lib/to-word.js";
 import { buildExcel } from "./lib/to-excel.js";
 import { convertWordToPdf } from "./lib/word-to-pdf.js";
 import { convertExcelToPdf } from "./lib/excel-to-pdf.js";
+import { convertPdfToPowerpoint, MAX_PPT_PAGES } from "./lib/pdf-to-powerpoint.js";
 
 const PORT = process.env.PORT || 8080;
 const MAX_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024); // 25 MB
@@ -197,6 +199,49 @@ for (const [slug, cfg] of Object.entries(REVERSE_CONVERTERS)) {
     },
   );
 }
+
+// ─── PDF → PowerPoint ───────────────────────────────────────────────────────
+// Distinct from the text-based converters above: it rasterizes each page to an
+// image (so it works on scanned PDFs too) and assembles a .pptx, one slide per
+// page. Reuses the PDF-only `upload` instance + the shared timeout.
+app.post(
+  "/convert/powerpoint",
+  convertLimiter,
+  upload.single("file"),
+  async (req, res, next) => {
+    try {
+      if (!req.file) throw httpError(400, "no_file", "No file was uploaded.");
+
+      let out;
+      try {
+        out = await withTimeout(
+          convertPdfToPowerpoint(req.file.buffer),
+          CONVERT_TIMEOUT_MS,
+        );
+      } catch (err) {
+        if (err.status) throw err; // already an httpError (e.g. timeout)
+        if (err.code === "too_many_pages") {
+          throw httpError(413, "too_many_pages", `This PDF has too many pages (limit ${MAX_PPT_PAGES}).`);
+        }
+        if (err.name === "PasswordException") {
+          throw httpError(422, "encrypted", "This PDF is password-protected. Remove the password first (Unlock PDF), then convert.");
+        }
+        throw httpError(422, "bad_pdf", "This file could not be read as a PDF — it may be corrupt.");
+      }
+
+      const base = safeBase(req.file.originalname);
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      );
+      res.setHeader("Content-Disposition", `attachment; filename="${base}.pptx"`);
+      res.setHeader("Cache-Control", "no-store");
+      res.send(out);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // ─── Error handling ─────────────────────────────────────────────────────────
 // eslint-disable-next-line no-unused-vars
