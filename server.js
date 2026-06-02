@@ -1,12 +1,14 @@
 // pdfprosafe.com — stateless conversion service.
 //
-// Two endpoints turn an uploaded PDF into an editable Office file:
-//   POST /convert/word   → .docx
-//   POST /convert/excel  → .xlsx
+// PDF ↔ Office conversions (both directions), all in-memory:
+//   POST /convert/word         → PDF → .docx
+//   POST /convert/excel        → PDF → .xlsx
+//   POST /convert/word-to-pdf  → .docx → PDF
+//   POST /convert/excel-to-pdf → .xlsx → PDF
 //
 // Privacy by construction: multer keeps the upload in memory (never on disk),
-// pdfjs reads it, the result buffer is streamed back, and every buffer is
-// garbage-collected when the request ends. Nothing is logged or persisted.
+// the result buffer is streamed back, and every buffer is garbage-collected
+// when the request ends. Nothing is logged or persisted.
 
 import express from "express";
 import cors from "cors";
@@ -16,6 +18,8 @@ import rateLimit from "express-rate-limit";
 import { extractPdf, MAX_PAGES } from "./lib/extract.js";
 import { buildWord } from "./lib/to-word.js";
 import { buildExcel } from "./lib/to-excel.js";
+import { convertWordToPdf } from "./lib/word-to-pdf.js";
+import { convertExcelToPdf } from "./lib/excel-to-pdf.js";
 
 const PORT = process.env.PORT || 8080;
 const MAX_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024); // 25 MB
@@ -122,6 +126,76 @@ for (const [target, cfg] of Object.entries(CONVERTERS)) {
       next(err);
     }
   });
+}
+
+// ─── Reverse conversions (Office → PDF) ─────────────────────────────────────
+
+const REVERSE_CONVERTERS = {
+  "word-to-pdf": {
+    build: convertWordToPdf,
+    mimes: [
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ],
+    exts: [".docx"],
+    label: "docx",
+  },
+  "excel-to-pdf": {
+    build: convertExcelToPdf,
+    mimes: [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ],
+    exts: [".xlsx"],
+    label: "xlsx",
+  },
+};
+
+/**
+ * Build a multer instance that accepts only specific MIME types / extensions.
+ * Used by the reverse converters; the original upload instance stays PDF-only.
+ */
+function makeUpload(mimes, exts) {
+  return multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_BYTES, files: 1 },
+    fileFilter(_req, file, cb) {
+      const nameLower = file.originalname.toLowerCase();
+      const ok =
+        mimes.includes(file.mimetype) ||
+        exts.some((e) => nameLower.endsWith(e));
+      if (ok) cb(null, true);
+      else cb(httpError(415, "bad_file", `Only ${exts.join("/")} files are accepted.`));
+    },
+  });
+}
+
+for (const [slug, cfg] of Object.entries(REVERSE_CONVERTERS)) {
+  const uploader = makeUpload(cfg.mimes, cfg.exts);
+  app.post(
+    `/convert/${slug}`,
+    convertLimiter,
+    uploader.single("file"),
+    async (req, res, next) => {
+      try {
+        if (!req.file) throw httpError(400, "no_file", "No file was uploaded.");
+
+        let out;
+        try {
+          out = await withTimeout(cfg.build(req.file.buffer), CONVERT_TIMEOUT_MS);
+        } catch (err) {
+          if (err.status) throw err; // already an httpError (e.g. timeout)
+          throw httpError(422, "bad_file", `Could not convert this ${cfg.label} — it may be corrupt or unsupported.`);
+        }
+
+        const base = safeBase(req.file.originalname);
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `attachment; filename="${base}.pdf"`);
+        res.setHeader("Cache-Control", "no-store");
+        res.send(out);
+      } catch (err) {
+        next(err);
+      }
+    },
+  );
 }
 
 // ─── Error handling ─────────────────────────────────────────────────────────

@@ -11,6 +11,8 @@ import { join } from "node:path";
 import { extractPdf } from "../lib/extract.js";
 import { buildWord } from "../lib/to-word.js";
 import { buildExcel } from "../lib/to-excel.js";
+import { convertWordToPdf } from "../lib/word-to-pdf.js";
+import { convertExcelToPdf } from "../lib/excel-to-pdf.js";
 
 const path =
   process.argv[2] || fileURLToPath(new URL("../sample.pdf", import.meta.url));
@@ -18,6 +20,11 @@ const TMP = tmpdir();
 
 function isZip(buf) {
   return buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b; // "PK"
+}
+
+function isPdf(buf) {
+  // "%PDF"
+  return buf.length > 4 && buf[0] === 0x25 && buf[1] === 0x50 && buf[2] === 0x44 && buf[3] === 0x46;
 }
 
 try {
@@ -41,6 +48,19 @@ try {
 
   await writeFile(join(TMP, "smoke.docx"), docx).catch(() => {});
   await writeFile(join(TMP, "smoke.xlsx"), xlsx).catch(() => {});
+
+  // ── Round-trip: Office → PDF ───────────────────────────────────────────
+  const pdfFromWord = await convertWordToPdf(docx);
+  const pdfFromExcel = await convertExcelToPdf(xlsx);
+  await writeFile(join(TMP, "smoke-from-word.pdf"), pdfFromWord).catch(() => {});
+  await writeFile(join(TMP, "smoke-from-excel.pdf"), pdfFromExcel).catch(() => {});
+
+  if (!isPdf(pdfFromWord)) problems.push("word-to-pdf output is not a PDF");
+  if (!isPdf(pdfFromExcel)) problems.push("excel-to-pdf output is not a PDF");
+  if (pdfFromWord.length < 200) problems.push("word-to-pdf output suspiciously small");
+  if (pdfFromExcel.length < 200) problems.push("excel-to-pdf output suspiciously small");
+
+  console.log(`→ word-to-pdf ${pdfFromWord.length}B, excel-to-pdf ${pdfFromExcel.length}B`);
 
   if (problems.length) {
     console.error("✗ SMOKE FAILED:");

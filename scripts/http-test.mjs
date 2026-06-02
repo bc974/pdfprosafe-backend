@@ -4,6 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+// (readFile already imported above — just used again for smoke outputs)
 
 const BASE = process.env.BASE || "http://localhost:8080";
 const pdf = fileURLToPath(new URL("../sample.pdf", import.meta.url));
@@ -56,6 +57,43 @@ async function post(path, blob, filename) {
 {
   const res = await post("/convert/word", new Blob([Buffer.from("%PDF-1.4\n%%EOF")], { type: "application/pdf" }), "empty.pdf");
   ok(res.status >= 400 && res.status < 500, `unparseable pdf → ${res.status} (graceful, no 500)`);
+}
+
+// ── Reverse: Word→PDF and Excel→PDF ──────────────────────────────────────────
+// Re-use the smoke outputs (they exist after the forward conversions ran earlier
+// in this same Node session — for the HTTP test we need them as file buffers).
+const TMP2 = tmpdir();
+const docxPath = join(TMP2, "smoke.docx");
+const xlsxPath = join(TMP2, "smoke.xlsx");
+let docxBuf, xlsxBuf;
+try {
+  docxBuf = await readFile(docxPath);
+  xlsxBuf = await readFile(xlsxPath);
+} catch {
+  // Smoke files not present — skip reverse tests (run smoke first)
+  console.log("  (skipping reverse tests: run smoke.mjs first)");
+}
+
+if (docxBuf) {
+  const res = await post("/convert/word-to-pdf",
+    new Blob([docxBuf], { type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document" }),
+    "test.docx");
+  const buf = Buffer.from(await res.arrayBuffer());
+  ok(res.status === 200, `word-to-pdf status 200 (${res.status})`);
+  ok(buf[0] === 0x25 && buf[1] === 0x50, `word-to-pdf returns a PDF (${buf.length}B)`);
+}
+if (xlsxBuf) {
+  const res = await post("/convert/excel-to-pdf",
+    new Blob([xlsxBuf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }),
+    "test.xlsx");
+  const buf = Buffer.from(await res.arrayBuffer());
+  ok(res.status === 200, `excel-to-pdf status 200 (${res.status})`);
+  ok(buf[0] === 0x25 && buf[1] === 0x50, `excel-to-pdf returns a PDF (${buf.length}B)`);
+}
+// Wrong type for reverse endpoint
+{
+  const res = await post("/convert/word-to-pdf", new Blob([bytes], { type: "application/pdf" }), "test.pdf");
+  ok(res.status === 415, `word-to-pdf rejects non-docx → ${res.status}`);
 }
 
 console.log(failures ? `\n✗ ${failures} HTTP assertion(s) failed` : "\n✓ ALL HTTP TESTS PASSED");
